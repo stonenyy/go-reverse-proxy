@@ -1,12 +1,16 @@
 package middleware
 
 import (
+	"bufio"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"time"
 
 	"go-reverse-proxy/internal/config"
+
 	"golang.org/x/time/rate"
 )
 
@@ -26,6 +30,14 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	n, err := rw.ResponseWriter.Write(b)
 	rw.written += int64(n)
 	return n, err
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("底层 ResponseWriter 不支持 Hijack")
+	}
+	return hijacker.Hijack()
 }
 
 // Logger 请求日志中间件
@@ -73,6 +85,7 @@ func RateLimiter(rps float64, burst int) func(http.Handler) http.Handler {
 // 支持两种校验：
 //   - 只检查 Header 是否存在（rule.Value 为空）
 //   - 检查 Header 存在且值精确匹配（rule.Value 非空）
+//
 // 任意规则不通过 → 401 Unauthorized
 func HeaderAuth(rules []config.HeaderRule) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -20,7 +22,7 @@ type Route struct {
 	Backends       []*Backend
 	Balancer       LoadBalancer
 	ReverseProxies map[string]*httputil.ReverseProxy
-	Handler        http.Handler // 含 Header 校验中间件的最终 handler
+	Handler        http.Handler
 }
 
 // Router 路由器
@@ -64,7 +66,8 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			route.ReverseProxies[bc.URL] = rp
 		}
 
-		// 构建该路由的核心转发 handler
+		// 构建核心转发 handler
+		// WebSocket 请求完全绕过 ReverseProxy，直接 TCP 隧道转发，避免 Header 重复问题
 		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			backend := route.Balancer.Next(route.Backends)
 			if backend == nil {
@@ -72,6 +75,14 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 				return
 			}
+
+			// ✅ WebSocket 请求：直接 TCP 隧道，不经过 ReverseProxy
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				proxyWebSocket(w, r, backend.URL)
+				return
+			}
+
+			// 普通 HTTP 请求：走 ReverseProxy
 			rp, ok := route.ReverseProxies[backend.URL.String()]
 			if !ok {
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -81,7 +92,7 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			rp.ServeHTTP(w, r)
 		})
 
-		// 如果配置了 required_headers，则在最外层挂载 HeaderAuth 中间件
+		// 按路由挂载 Header 校验中间件
 		if len(rc.RequiredHeaders) > 0 {
 			h = middleware.HeaderAuth(rc.RequiredHeaders)(h)
 			log.Printf("[路由] %s 已启用 Header 校验，规则数: %d", rc.Path, len(rc.RequiredHeaders))
@@ -120,11 +131,78 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 	}
 
 	rp.ModifyResponse = func(resp *http.Response) error {
-		resp.Header.Set("Via", "go-reverse-proxy/1.0")
+		resp.Header.Set("Via", "go-reverse-proxy/1.1")
 		return nil
 	}
 
 	return rp
+}
+
+// proxyWebSocket 使用原始 TCP 隧道转发 WebSocket，完全不经过 ReverseProxy
+// 原理：HTTP CONNECT 隧道 —— 劫持客户端连接后直接与后端 TCP 双向 copy
+func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
+	// 连接后端
+	backendAddr := target.Host
+	if target.Port() == "" {
+		if target.Scheme == "https" {
+			backendAddr += ":443"
+		} else {
+			backendAddr += ":80"
+		}
+	}
+
+	backendConn, err := net.DialTimeout("tcp", backendAddr, 10*time.Second)
+	if err != nil {
+		log.Printf("[WS ERROR] 连接后端失败 %s: %v", backendAddr, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer backendConn.Close()
+
+	// 劫持客户端连接
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		log.Printf("[WS ERROR] 不支持 Hijack")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	clientConn, bufrw, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("[WS ERROR] Hijack 失败: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// 把原始 HTTP 升级请求转发给后端
+	if err := r.Write(backendConn); err != nil {
+		log.Printf("[WS ERROR] 转发握手请求失败: %v", err)
+		return
+	}
+
+	log.Printf("[WS] %s %s <-> %s", r.Method, r.URL.Path, backendAddr)
+
+	// 双向 TCP copy
+	done := make(chan struct{}, 2)
+
+	go func() {
+		// 后端 → 客户端（先把 bufio 里缓存的数据刷完）
+		if bufrw.Reader.Buffered() > 0 {
+			buf := make([]byte, bufrw.Reader.Buffered())
+			bufrw.Read(buf)
+			backendConn.Write(buf)
+		}
+		io.Copy(clientConn, backendConn)
+		done <- struct{}{}
+	}()
+
+	go func() {
+		// 客户端 → 后端
+		io.Copy(backendConn, clientConn)
+		done <- struct{}{}
+	}()
+
+	<-done
+	log.Printf("[WS] 连接关闭: %s", r.URL.Path)
 }
 
 // Match 匹配路由
