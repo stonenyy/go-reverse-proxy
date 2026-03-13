@@ -1,0 +1,51 @@
+# 反向代理配置文件
+
+server:
+  port: 8080
+  read_timeout: 30
+  write_timeout: 30
+  idle_timeout: 60
+
+routes:
+  - path: /api/
+    backends:
+      - url: http://localhost:9001
+        weight: 2
+      - url: http://localhost:9002
+        weight: 1
+    load_balance: weighted
+    # ✅ Header 校验：两种模式都支持
+    required_headers:
+      - name: X-API-Key        # 必须存在且值精确匹配
+        value: my-secret-key
+      - name: X-App-ID         # 只要 Header 存在即可，不校验值
+        value: ""
+
+  - path: /static/
+    backends:
+      - url: http://localhost:9003
+        weight: 1
+    load_balance: roundrobin
+    # 不配置 required_headers = 不限制，直接放行
+
+  - path: /
+    backends:
+      - url: http://localhost:9001
+        weight: 1
+    load_balance: roundrobin
+
+rate_limit:
+  enabled: true
+  requests_per_second: 100
+  burst: 200
+
+health_check:
+  enabled: true
+  interval: 10
+  timeout: 5
+  path: /health
+
+# TLS（可选）
+tls:
+  cert_file: ./certs/server.crt
+  key_file: ./certs/server.key
