@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go-reverse-proxy/internal/config"
+	"go-reverse-proxy/internal/metrics"
 
 	"golang.org/x/time/rate"
 )
@@ -65,12 +66,29 @@ func Recovery(next http.Handler) http.Handler {
 	})
 }
 
+// Metrics 请求指标中间件
+func Metrics(metrics *metrics.Metrics) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			metrics.IncRequest()
+			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(rw, r)
+			if rw.statusCode >= 500 {
+				metrics.IncError()
+			}
+		})
+	}
+}
+
 // RateLimiter 限流中间件（令牌桶算法）
-func RateLimiter(rps float64, burst int) func(http.Handler) http.Handler {
+func RateLimiter(rps float64, burst int, metrics *metrics.Metrics) func(http.Handler) http.Handler {
 	limiter := rate.NewLimiter(rate.Limit(rps), burst)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !limiter.Allow() {
+				if metrics != nil {
+					metrics.IncRateLimited()
+				}
 				log.Printf("[RATE LIMIT] 请求被限流: %s %s", r.Method, r.URL.Path)
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)

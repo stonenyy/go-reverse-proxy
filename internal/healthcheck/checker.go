@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -22,11 +23,11 @@ type Checker struct {
 
 // Stats 节点统计信息
 type Stats struct {
-	Total   int
-	Success int
-	Fail    int
+	Total     int
+	Success   int
+	Fail      int
 	LastCheck time.Time
-	Alive   bool
+	Alive     bool
 }
 
 func New(backends []*proxy.Backend, cfg config.HealthCheckConfig) *Checker {
@@ -73,7 +74,7 @@ func (c *Checker) checkAll() {
 }
 
 func (c *Checker) check(b *proxy.Backend) {
-	checkURL := b.URL.String() + c.cfg.Path
+	checkURL := b.URL.ResolveReference(&url.URL{Path: c.cfg.Path}).String()
 
 	resp, err := c.client.Get(checkURL)
 
@@ -86,7 +87,7 @@ func (c *Checker) check(b *proxy.Backend) {
 	stat.LastCheck = time.Now()
 	c.mu.Unlock()
 
-	if err != nil || resp.StatusCode >= 500 {
+	if err != nil {
 		if b.Alive.Load() {
 			log.Printf("[健康检查] ❌ 节点下线: %s (err: %v)", b.URL.String(), err)
 		}
@@ -97,7 +98,19 @@ func (c *Checker) check(b *proxy.Backend) {
 		c.mu.Unlock()
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 500 {
+		if b.Alive.Load() {
+			log.Printf("[健康检查] ❌ 节点下线: %s (status: %d)", b.URL.String(), resp.StatusCode)
+		}
+		b.Alive.Store(false)
+		c.mu.Lock()
+		stat.Fail++
+		stat.Alive = false
+		c.mu.Unlock()
+		return
+	}
 
 	if !b.Alive.Load() {
 		log.Printf("[健康检查] ✅ 节点恢复: %s", b.URL.String())

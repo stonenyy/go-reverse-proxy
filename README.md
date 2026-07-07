@@ -11,6 +11,7 @@
 - ✅ **中间件** - 日志、Panic 恢复、CORS
 - ✅ **优雅退出** - 接收 SIGINT/SIGTERM 信号平滑关闭
 - ✅ **Header 透传** - X-Forwarded-For / X-Real-IP
+- ✅ **指标收集** - 请求总数、错误数、限流数
 - ✅ **TLS 支持** - 配置证书即可启用 HTTPS
 - ✅ **管理接口** - 查看节点状态和统计信息
 
@@ -36,7 +37,7 @@ go run tools/mockserver/main.go
 go run cmd/main.go -config configs/config.yaml
 ```
 
-### 4. 测试
+### 4. 手动功能测试
 
 ```bash
 # 测试 API 路由（会在 9001 和 9002 之间负载均衡）
@@ -54,8 +55,21 @@ curl http://localhost:8080/__proxy/status
 # 查看节点统计
 curl http://localhost:8080/__proxy/stats
 
+# 查看运行指标
+curl http://localhost:8080/__proxy/metrics
+
 # 代理自身健康检查
 curl http://localhost:8080/__proxy/health
+```
+
+### 5. 单元测试
+
+```bash
+# 使用 Makefile
+make test
+
+# 或者直接运行 Go 测试
+go test ./...
 ```
 
 ## 配置说明
@@ -101,6 +115,7 @@ make build
 | `GET /__proxy/health` | 代理自身健康状态 |
 | `GET /__proxy/status` | 所有后端节点状态 |
 | `GET /__proxy/stats`  | 健康检查统计数据 |
+| `GET /__proxy/metrics` | 运行指标，包括请求总数、错误数和限流数 |
 
 ## 目录结构
 
@@ -110,6 +125,7 @@ make build
 │   └── main.go                  # 程序入口
 ├── internal/
 │   ├── config/config.go         # 配置解析
+│   ├── metrics/metrics.go       # 运行时指标
 │   ├── proxy/
 │   │   ├── router.go            # 路由 & 反向代理核心
 │   │   └── balancer.go          # 负载均衡策略

@@ -18,6 +18,15 @@ mock-backend:
 	@go run ./tools/mockserver/main.go &
 	@echo "后端服务已启动: 9001, 9002, 9003"
 
+# 运行测试
+test:
+	go test ./...
+
+# 格式化并静态检查
+lint:
+	go fmt ./...
+	go vet ./...
+
 # 编译并运行
 start: build
 	./bin/proxy -config configs/config.yaml

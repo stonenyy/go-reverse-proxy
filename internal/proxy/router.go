@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -77,7 +78,7 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			}
 
 			// ✅ WebSocket 请求：直接 TCP 隧道，不经过 ReverseProxy
-			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			if isWebSocketRequest(r) {
 				proxyWebSocket(w, r, backend.URL)
 				return
 			}
@@ -117,12 +118,22 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 	originalDirector := rp.Director
 	rp.Director = func(req *http.Request) {
 		originalDirector(req)
-		if clientIP := req.Header.Get("X-Forwarded-For"); clientIP == "" {
-			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+		clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+		if err != nil {
+			clientIP = req.RemoteAddr
 		}
-		req.Header.Set("X-Real-IP", req.RemoteAddr)
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+		} else {
+			req.Header.Set("X-Forwarded-For", clientIP)
+		}
+		req.Header.Set("X-Real-IP", clientIP)
 		req.Header.Set("X-Forwarded-Host", req.Host)
-		req.Header.Set("X-Forwarded-Proto", "http")
+		if req.TLS != nil {
+			req.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
 	}
 
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -140,18 +151,30 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 
 // proxyWebSocket 使用原始 TCP 隧道转发 WebSocket，完全不经过 ReverseProxy
 // 原理：HTTP CONNECT 隧道 —— 劫持客户端连接后直接与后端 TCP 双向 copy
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
 func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	// 连接后端
 	backendAddr := target.Host
 	if target.Port() == "" {
-		if target.Scheme == "https" {
+		if target.Scheme == "https" || target.Scheme == "wss" {
 			backendAddr += ":443"
 		} else {
 			backendAddr += ":80"
 		}
 	}
 
-	backendConn, err := net.DialTimeout("tcp", backendAddr, 10*time.Second)
+	var backendConn net.Conn
+	var err error
+	if target.Scheme == "https" || target.Scheme == "wss" {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		backendConn, err = tls.DialWithDialer(dialer, "tcp", backendAddr, &tls.Config{})
+	} else {
+		backendConn, err = net.DialTimeout("tcp", backendAddr, 10*time.Second)
+	}
 	if err != nil {
 		log.Printf("[WS ERROR] 连接后端失败 %s: %v", backendAddr, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)

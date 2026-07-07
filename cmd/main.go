@@ -14,6 +14,7 @@ import (
 
 	"go-reverse-proxy/internal/config"
 	"go-reverse-proxy/internal/healthcheck"
+	"go-reverse-proxy/internal/metrics"
 	"go-reverse-proxy/internal/middleware"
 	"go-reverse-proxy/internal/proxy"
 )
@@ -37,51 +38,26 @@ func main() {
 		log.Fatalf("初始化路由失败: %v", err)
 	}
 
-	// 构建中间件链
-	middlewares := []func(http.Handler) http.Handler{
-		middleware.Recovery,
-		middleware.Logger,
-		middleware.CORS,
-	}
-	if cfg.RateLimit.Enabled {
-		middlewares = append(middlewares,
-			middleware.RateLimiter(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst),
-		)
-		log.Printf("✅ 限流已启用: %.0f req/s, burst %d", cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst)
-	}
+	// 构建请求处理器
+	metricsStore := metrics.New()
+	handler := buildHandler(cfg, router, metricsStore)
 
-	handler := middleware.Chain(router, middlewares...)
-
-	// 注册管理接口
-	mux := http.NewServeMux()
-	mux.Handle("/", handler)
-	mux.HandleFunc("/__proxy/status", statusHandler(router))
-	mux.HandleFunc("/__proxy/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "OK")
-	})
-
-	// 启动健康检查
+	// 启动健康检查和管理接口
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var checker *healthcheck.Checker
+	mux := newMux(handler, router, nil, metricsStore)
 	if cfg.HealthCheck.Enabled {
-		checker := healthcheck.New(router.GetAllBackends(), cfg.HealthCheck)
+		checker = healthcheck.New(router.GetAllBackends(), cfg.HealthCheck)
 		go checker.Start(ctx)
-		// 将 checker 注入 status handler
-		mux.HandleFunc("/__proxy/stats", statsHandler(checker))
+		mux = newMux(handler, router, checker, metricsStore)
 		log.Printf("✅ 健康检查已启用: 间隔 %ds", cfg.HealthCheck.Interval)
 	}
 
-	// 启动 HTTP Server
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  cfg.Server.ReadTimeoutDuration(),
-		WriteTimeout: cfg.Server.WriteTimeoutDuration(),
-		IdleTimeout:  cfg.Server.IdleTimeoutDuration(),
-	}
+	// 启动 HTTP Server
+	srv := newServer(cfg, mux)
 
 	// 优雅退出
 	quit := make(chan os.Signal, 1)
@@ -119,6 +95,47 @@ func main() {
 	log.Println("👋 服务器已关闭")
 }
 
+func buildHandler(cfg *config.Config, router *proxy.Router, metrics *metrics.Metrics) http.Handler {
+	middlewares := []func(http.Handler) http.Handler{
+		middleware.Recovery,
+		middleware.Logger,
+		middleware.CORS,
+		middleware.Metrics(metrics),
+	}
+	if cfg.RateLimit.Enabled {
+		middlewares = append(middlewares,
+			middleware.RateLimiter(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst, metrics),
+		)
+		log.Printf("✅ 限流已启用: %.0f req/s, burst %d", cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst)
+	}
+	return middleware.Chain(router, middlewares...)
+}
+
+func newMux(handler http.Handler, router *proxy.Router, checker *healthcheck.Checker, metricsStore *metrics.Metrics) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/", handler)
+	mux.HandleFunc("/__proxy/status", statusHandler(router))
+	mux.HandleFunc("/__proxy/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	})
+	if checker != nil {
+		mux.HandleFunc("/__proxy/stats", statsHandler(checker))
+	}
+	mux.HandleFunc("/__proxy/metrics", metricsHandler(metricsStore))
+	return mux
+}
+
+func newServer(cfg *config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
+		Handler:      handler,
+		ReadTimeout:  cfg.Server.ReadTimeoutDuration(),
+		WriteTimeout: cfg.Server.WriteTimeoutDuration(),
+		IdleTimeout:  cfg.Server.IdleTimeoutDuration(),
+	}
+}
+
 // statusHandler 返回路由状态
 func statusHandler(router *proxy.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -149,5 +166,16 @@ func statsHandler(checker *healthcheck.Checker) http.HandlerFunc {
 		stats := checker.GetStats()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
+	}
+}
+
+func metricsHandler(metricsStore *metrics.Metrics) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if metricsStore == nil {
+			http.Error(w, "Metrics unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(metricsStore.Snapshot())
 	}
 }

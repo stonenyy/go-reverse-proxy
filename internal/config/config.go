@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -100,5 +102,85 @@ func Load(path string) (*Config, error) {
 		cfg.HealthCheck.Path = "/health"
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+func (c *Config) Validate() error {
+	if c.Server.Port <= 0 || c.Server.Port > 65535 {
+		return fmt.Errorf("server.port must be between 1 and 65535")
+	}
+	if len(c.Routes) == 0 {
+		return fmt.Errorf("routes must contain at least one route")
+	}
+	for i, route := range c.Routes {
+		if strings.TrimSpace(route.Path) == "" {
+			return fmt.Errorf("routes[%d].path must not be empty", i)
+		}
+		if !strings.HasPrefix(route.Path, "/") {
+			return fmt.Errorf("routes[%d].path must start with /", i)
+		}
+		if len(route.Backends) == 0 {
+			return fmt.Errorf("routes[%d] must contain at least one backend", i)
+		}
+		switch route.LoadBalance {
+		case "", "roundrobin", "weighted", "random":
+		default:
+			return fmt.Errorf("routes[%d].load_balance invalid: %s", i, route.LoadBalance)
+		}
+		for j, backend := range route.Backends {
+			if strings.TrimSpace(backend.URL) == "" {
+				return fmt.Errorf("routes[%d].backends[%d].url must not be empty", i, j)
+			}
+			u, err := url.Parse(backend.URL)
+			if err != nil {
+				return fmt.Errorf("routes[%d].backends[%d].url invalid: %w", i, j, err)
+			}
+			if u.Scheme == "" || u.Host == "" {
+				return fmt.Errorf("routes[%d].backends[%d].url must include scheme and host", i, j)
+			}
+			if u.Scheme != "http" && u.Scheme != "https" {
+				return fmt.Errorf("routes[%d].backends[%d].url unsupported scheme: %s", i, j, u.Scheme)
+			}
+			if backend.Weight < 0 {
+				return fmt.Errorf("routes[%d].backends[%d].weight must be non-negative", i, j)
+			}
+		}
+		for j, rule := range route.RequiredHeaders {
+			if strings.TrimSpace(rule.Name) == "" {
+				return fmt.Errorf("routes[%d].required_headers[%d].name must not be empty", i, j)
+			}
+		}
+	}
+	if c.RateLimit.Enabled {
+		if c.RateLimit.RequestsPerSecond <= 0 {
+			return fmt.Errorf("rate_limit.requests_per_second must be > 0")
+		}
+		if c.RateLimit.Burst <= 0 {
+			return fmt.Errorf("rate_limit.burst must be > 0")
+		}
+	}
+	if c.HealthCheck.Enabled {
+		if c.HealthCheck.Interval <= 0 {
+			return fmt.Errorf("health_check.interval must be > 0")
+		}
+		if c.HealthCheck.Timeout <= 0 {
+			return fmt.Errorf("health_check.timeout must be > 0")
+		}
+		if strings.TrimSpace(c.HealthCheck.Path) == "" {
+			return fmt.Errorf("health_check.path must not be empty")
+		}
+		if !strings.HasPrefix(c.HealthCheck.Path, "/") {
+			return fmt.Errorf("health_check.path must start with /")
+		}
+	}
+	if c.TLS != nil {
+		if strings.TrimSpace(c.TLS.CertFile) == "" || strings.TrimSpace(c.TLS.KeyFile) == "" {
+			return fmt.Errorf("tls.cert_file and tls.key_file must both be provided")
+		}
+	}
+	return nil
 }

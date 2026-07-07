@@ -3,3 +3,7 @@ certs/
 
 .vscode/
 .codegpt
+
+go.sum
+
+*_test.go

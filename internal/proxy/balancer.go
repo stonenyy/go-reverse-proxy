@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"math"
 	"math/rand"
 	"net/url"
 	"sync"
@@ -9,9 +10,9 @@ import (
 
 // Backend 后端服务节点
 type Backend struct {
-	URL     *url.URL
-	Weight  int
-	Alive   atomic.Bool
+	URL    *url.URL
+	Weight int
+	Alive  atomic.Bool
 }
 
 // LoadBalancer 负载均衡器接口
@@ -41,9 +42,8 @@ func (r *RoundRobinBalancer) Next(backends []*Backend) *Backend {
 // ----------------------------------------
 
 type WeightedBalancer struct {
-	mu      sync.Mutex
-	current int
-	cw      int // 当前权重
+	mu             sync.Mutex
+	currentWeights map[string]int
 }
 
 func (w *WeightedBalancer) Next(backends []*Backend) *Backend {
@@ -55,43 +55,35 @@ func (w *WeightedBalancer) Next(backends []*Backend) *Backend {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// 平滑加权轮询算法（Nginx 同款）
+	if w.currentWeights == nil {
+		w.currentWeights = make(map[string]int)
+	}
+
 	totalWeight := 0
 	for _, b := range alive {
 		totalWeight += b.Weight
-	}
-
-	type item struct {
-		backend       *Backend
-		currentWeight int
-	}
-
-	items := make([]item, len(alive))
-	for i, b := range alive {
-		items[i] = item{backend: b, currentWeight: b.Weight}
-	}
-
-	// 找最大权重节点
-	best := -1
-	maxWeight := -1 << 62
-
-	for i := range items {
-		if items[i].currentWeight > maxWeight {
-			maxWeight = items[i].currentWeight
-			best = i
+		if _, ok := w.currentWeights[b.URL.String()]; !ok {
+			w.currentWeights[b.URL.String()] = 0
 		}
 	}
 
-	if best == -1 {
+	var best *Backend
+	bestWeight := math.MinInt
+	for _, b := range alive {
+		key := b.URL.String()
+		w.currentWeights[key] += b.Weight
+		if w.currentWeights[key] > bestWeight {
+			bestWeight = w.currentWeights[key]
+			best = b
+		}
+	}
+
+	if best == nil {
 		return alive[0]
 	}
 
-	items[best].currentWeight -= totalWeight
-	for i := range items {
-		items[i].currentWeight += items[i].backend.Weight
-	}
-
-	return items[best].backend
+	w.currentWeights[best.URL.String()] -= totalWeight
+	return best
 }
 
 // ----------------------------------------
