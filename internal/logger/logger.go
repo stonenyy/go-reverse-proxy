@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -18,16 +19,46 @@ type dailyFileWriter struct {
 
 var currentWriter *dailyFileWriter
 
-// Init 初始化日志系统，按天轮换日志文件并写入 logs 目录。
+// Init 初始化日志系统：
+// - 相对路径基于可执行文件所在目录进行解析
+// - 如果无法创建该目录，会依次回退到 /var/log/go-reverse-proxy 或临时目录
+// - 日志同时写入 stdout 和文件，按天轮换
 func Init(logDir string) error {
+	if logDir == "" {
+		logDir = "logs"
+	}
+
+	// 如果是相对路径，基于可执行文件目录
+	if !filepath.IsAbs(logDir) {
+		if exe, err := os.Executable(); err == nil {
+			base := filepath.Dir(exe)
+			logDir = filepath.Join(base, logDir)
+		} else if cwd, err := os.Getwd(); err == nil {
+			logDir = filepath.Join(cwd, logDir)
+		}
+	}
+
+	// 尝试创建目录，若失败则尝试回退位置
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return err
+		alt := "/var/log/go-reverse-proxy"
+		if err2 := os.MkdirAll(alt, 0o755); err2 == nil {
+			logDir = alt
+		} else {
+			alt2 := filepath.Join(os.TempDir(), "go-reverse-proxy-logs")
+			if err3 := os.MkdirAll(alt2, 0o755); err3 == nil {
+				logDir = alt2
+			} else {
+				return fmt.Errorf("无法创建日志目录: %v", err)
+			}
+		}
 	}
 
 	writer, err := newDailyFileWriter(logDir)
 	if err != nil {
 		return err
 	}
+
+	log.Printf("日志写入目录: %s", logDir)
 
 	log.SetOutput(io.MultiWriter(os.Stdout, writer))
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
