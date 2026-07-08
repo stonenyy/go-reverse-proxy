@@ -14,6 +14,7 @@ import (
 
 	"go-reverse-proxy/internal/config"
 	"go-reverse-proxy/internal/healthcheck"
+	"go-reverse-proxy/internal/logger"
 	"go-reverse-proxy/internal/metrics"
 	"go-reverse-proxy/internal/middleware"
 	"go-reverse-proxy/internal/proxy"
@@ -23,6 +24,14 @@ func main() {
 	// 命令行参数
 	configPath := flag.String("config", "configs/config.yaml", "配置文件路径")
 	flag.Parse()
+
+	// 初始化日志
+	if err := logger.Init("logs"); err != nil {
+		log.Fatalf("初始化日志失败: %v", err)
+	}
+	defer func() {
+		_ = logger.Close()
+	}()
 
 	// 加载配置
 	cfg, err := config.Load(*configPath)
