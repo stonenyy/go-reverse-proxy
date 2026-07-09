@@ -1,0 +1,18 @@
+[Unit]
+Description=Go Reverse Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=proxy
+Group=proxy
+WorkingDirectory=/path/to/go-reverse-proxy
+Environment=LOG_DIR=/var/log/go-reverse-proxy
+ExecStart=/path/to/go-reverse-proxy/bin/proxy -config /path/to/go-reverse-proxy/configs/config.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

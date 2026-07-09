@@ -20,22 +20,21 @@ type dailyFileWriter struct {
 var currentWriter *dailyFileWriter
 
 // Init 初始化日志系统：
-// - 相对路径基于可执行文件所在目录进行解析
-// - 如果无法创建该目录，会依次回退到 /var/log/go-reverse-proxy 或临时目录
+// - 支持 LOG_DIR 环境变量覆盖
+// - 相对路径优先基于当前工作目录解析，避免服务运行时落到二进制目录
+// - 如果无法创建目标目录，会依次回退到 /var/log/go-reverse-proxy 或临时目录
 // - 日志同时写入 stdout 和文件，按天轮换
 func Init(logDir string) error {
+	if envDir := os.Getenv("LOG_DIR"); envDir != "" {
+		logDir = envDir
+	}
 	if logDir == "" {
-		logDir = "logs"
+		logDir = "/var/log/go-reverse-proxy"
 	}
 
-	// 如果是相对路径，基于可执行文件目录
 	if !filepath.IsAbs(logDir) {
-		if exe, err := os.Executable(); err == nil {
-			base := filepath.Dir(exe)
-			logDir = filepath.Join(base, logDir)
-		} else if cwd, err := os.Getwd(); err == nil {
-			logDir = filepath.Join(cwd, logDir)
-		}
+		logRoot := resolveLogBase(logDir)
+		logDir = filepath.Join(logRoot, logDir)
 	}
 
 	// 尝试创建目录，若失败则尝试回退位置
@@ -82,6 +81,16 @@ func newDailyFileWriter(logDir string) (*dailyFileWriter, error) {
 		return nil, err
 	}
 	return w, nil
+}
+
+func resolveLogBase(logDir string) string {
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
+	}
+	return "."
 }
 
 func (w *dailyFileWriter) Write(p []byte) (int, error) {

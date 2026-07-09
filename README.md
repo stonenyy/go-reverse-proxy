@@ -108,6 +108,36 @@ make build
 ./bin/proxy -config configs/config.yaml
 ```
 
+## 运行日志
+
+默认日志目录统一为 `/var/log/go-reverse-proxy`，程序会按每日文件写入：
+
+```bash
+/var/log/go-reverse-proxy/2026-07-09.log
+```
+
+如果需要覆盖默认目录，可以设置环境变量：
+
+```bash
+export LOG_DIR=/path/to/logs
+./bin/proxy -config configs/config.yaml
+```
+
+> 注意：如果使用 `/var/log/go-reverse-proxy`，请确保服务用户对该目录有写权限：
+
+```bash
+sudo mkdir -p /var/log/go-reverse-proxy
+sudo chown -R <service-user>:<service-group> /var/log/go-reverse-proxy
+```
+
+## systemd 启动示例
+
+项目已提供一个示例 unit 文件：
+
+`systemd/go-reverse-proxy.service`
+
+请根据实际路径修改其中的 `WorkingDirectory`、`ExecStart` 和 `User/Group`。
+
 ## 管理接口
 
 | 接口 | 说明 |
