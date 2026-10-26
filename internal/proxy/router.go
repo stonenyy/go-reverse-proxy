@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go-reverse-proxy/internal/config"
@@ -29,6 +30,7 @@ type Route struct {
 
 // Router 路由器
 type Router struct {
+	mu        sync.RWMutex
 	routes    []*Route
 	transport *http.Transport
 }
@@ -43,7 +45,19 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 	}
 
 	router := &Router{transport: transport}
+	if err := router.UpdateRoutes(routes); err != nil {
+		return nil, err
+	}
 
+	return router, nil
+}
+
+// UpdateRoutes 动态更新路由规则
+func (r *Router) UpdateRoutes(routes []config.RouteConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var newRoutes []*Route
 	for _, rc := range routes {
 		route := &Route{
 			Path:           rc.Path,
@@ -54,7 +68,7 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 		for _, bc := range rc.Backends {
 			target, err := url.Parse(bc.URL)
 			if err != nil {
-				return nil, fmt.Errorf("解析后端地址失败 %s: %w", bc.URL, err)
+				return fmt.Errorf("解析后端地址失败 %s: %w", bc.URL, err)
 			}
 			weight := bc.Weight
 			if weight <= 0 {
@@ -64,7 +78,7 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			backend.Alive.Store(true)
 			route.Backends = append(route.Backends, backend)
 
-			rp := newReverseProxy(target, transport)
+			rp := newReverseProxy(target, r.transport)
 			route.ReverseProxies[bc.URL] = rp
 		}
 
@@ -99,7 +113,6 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			rp.ServeHTTP(w, r)
 		})
 
-		// 按路由挂载 Header 校验中间件
 		if len(rc.RequiredHeaders) > 0 {
 			h = middleware.HeaderAuth(rc.RequiredHeaders)(h)
 			logger.Log.Info("Header authentication enabled for route",
@@ -109,15 +122,16 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 		}
 
 		route.Handler = h
-		router.routes = append(router.routes, route)
+		newRoutes = append(newRoutes, route)
 	}
 
-	// 按路径长度降序排列（精确路径优先匹配）
-	sort.Slice(router.routes, func(i, j int) bool {
-		return len(router.routes[i].Path) > len(router.routes[j].Path)
+	sort.Slice(newRoutes, func(i, j int) bool {
+		return len(newRoutes[i].Path) > len(newRoutes[j].Path)
 	})
 
-	return router, nil
+	r.routes = newRoutes
+	logger.Log.Info("Router configuration updated successfully", zap.Int("routes_count", len(newRoutes)))
+	return nil
 }
 
 func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.ReverseProxy {
@@ -162,6 +176,8 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 	return rp
 }
 
+// proxyWebSocket 使用原始 TCP 隧道转发 WebSocket，完全不经过 ReverseProxy
+// 原理：HTTP CONNECT 隧道 —— 劫持客户端连接后直接与后端 TCP 双向 copy
 // proxyWebSocket 使用原始 TCP 隧道转发 WebSocket，完全不经过 ReverseProxy
 // 原理：HTTP CONNECT 隧道 —— 劫持客户端连接后直接与后端 TCP 双向 copy
 func isWebSocketRequest(r *http.Request) bool {
@@ -276,8 +292,9 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	logger.Log.Info("WebSocket connection closed", zap.String("path", r.URL.Path))
 }
 
-// Match 匹配路由
 func (r *Router) Match(path string) *Route {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, route := range r.routes {
 		if strings.HasPrefix(path, route.Path) {
 			return route

@@ -18,6 +18,9 @@ import (
 	"go-reverse-proxy/internal/metrics"
 	"go-reverse-proxy/internal/middleware"
 	"go-reverse-proxy/internal/proxy"
+
+	"github.com/fsnotify/fsnotify"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -51,17 +54,20 @@ func main() {
 	metricsStore := metrics.New()
 	handler := buildHandler(cfg, router, metricsStore)
 
-	// 启动健康检查和管理接口
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 启动配置监听 (热加载)
+	go watchConfig(*configPath, cfg, router)
+
+	// 启动健康检查和管理接口
 	var checker *healthcheck.Checker
 	mux := newMux(handler, router, nil, metricsStore)
 	if cfg.HealthCheck.Enabled {
 		checker = healthcheck.New(router.GetAllBackends(), cfg.HealthCheck)
 		go checker.Start(ctx)
 		mux = newMux(handler, router, checker, metricsStore)
-		log.Printf("✅ 健康检查已启用: 间隔 %ds", cfg.HealthCheck.Interval)
+		logger.Log.Info("✅ Health check enabled", zap.Int("interval", cfg.HealthCheck.Interval))
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
@@ -73,35 +79,87 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("🚀 反向代理启动成功，监听 %s", addr)
-		log.Printf("   管理接口: http://localhost%s/__proxy/status", addr)
-		log.Printf("   健康接口: http://localhost%s/__proxy/health", addr)
-		log.Printf("   节点统计: http://localhost%s/__proxy/stats", addr)
+		logger.Log.Info("🚀 Reverse proxy started",
+			zap.String("addr", addr),
+			zap.String("config", *configPath),
+		)
+		logger.Log.Info("Management interface available",
+			zap.String("status", "http://localhost"+addr+"/__proxy/status"),
+			zap.String("health", "http://localhost"+addr+"/__proxy/health"),
+			zap.String("stats", "http://localhost"+addr+"/__proxy/stats"),
+		)
 
 		var listenErr error
 		if cfg.TLS != nil {
-			log.Printf("🔒 TLS 已启用")
+			logger.Log.Info("🔒 TLS enabled")
 			listenErr = srv.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		} else {
 			listenErr = srv.ListenAndServe()
 		}
 
 		if listenErr != nil && listenErr != http.ErrServerClosed {
-			log.Fatalf("服务器启动失败: %v", listenErr)
+			logger.Log.Fatal("Server startup failed", zap.Error(listenErr))
 		}
 	}()
 
 	<-quit
-	log.Println("⏳ 收到退出信号，开始优雅关闭...")
+	logger.Log.Info("Received exit signal, shutting down gracefully...")
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("优雅关闭失败: %v", err)
+		logger.Log.Fatal("Graceful shutdown failed", zap.Error(err))
 	}
-	log.Println("👋 服务器已关闭")
+	logger.Log.Info("Server closed")
+}
+
+func watchConfig(path string, cfg *config.Config, router *proxy.Router) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logger.Log.Error("Failed to create config watcher", zap.Error(err))
+		return
+	}
+	defer watcher.Close()
+
+	err = watcher.Add(path)
+	if err != nil {
+		logger.Log.Error("Failed to add config file to watcher", zap.String("path", path), zap.Error(err))
+		return
+	}
+
+	logger.Log.Info("Watching config file for changes", zap.String("path", path))
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				logger.Log.Info("Config file modified, reloading...", zap.String("path", path))
+
+				newCfg, err := config.Load(path)
+				if err != nil {
+					logger.Log.Error("Failed to reload config", zap.Error(err))
+					continue
+				}
+
+				if err := router.UpdateRoutes(newCfg.Routes); err != nil {
+					logger.Log.Error("Failed to update routes", zap.Error(err))
+					continue
+				}
+
+				logger.Log.Info("Config reloaded successfully")
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			logger.Log.Error("Config watcher error", zap.Error(err))
+		}
+	}
 }
 
 func buildHandler(cfg *config.Config, router *proxy.Router, metrics *metrics.Metrics) http.Handler {
