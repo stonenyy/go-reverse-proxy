@@ -10,9 +10,10 @@ import (
 
 // Backend 后端服务节点
 type Backend struct {
-	URL    *url.URL
-	Weight int
-	Alive  atomic.Bool
+	URL               *url.URL
+	Weight            int
+	Alive             atomic.Bool
+	ActiveConnections int64 // 当前活跃连接数
 }
 
 // LoadBalancer 负载均衡器接口
@@ -101,6 +102,31 @@ func (r *RandomBalancer) Next(backends []*Backend) *Backend {
 }
 
 // ----------------------------------------
+// 最少连接负载均衡
+// ----------------------------------------
+
+type LeastConnectionsBalancer struct{}
+
+func (l *LeastConnectionsBalancer) Next(backends []*Backend) *Backend {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
+		return nil
+	}
+
+	var best *Backend
+	minConns := int64(math.MaxInt64)
+
+	for _, b := range alive {
+		conns := atomic.LoadInt64(&b.ActiveConnections)
+		if conns < minConns {
+			minConns = conns
+			best = b
+		}
+	}
+	return best
+}
+
+// ----------------------------------------
 // 工具函数
 // ----------------------------------------
 
@@ -120,6 +146,8 @@ func NewLoadBalancer(strategy string) LoadBalancer {
 		return &WeightedBalancer{}
 	case "random":
 		return &RandomBalancer{}
+	case "leastconn":
+		return &LeastConnectionsBalancer{}
 	default:
 		return &RoundRobinBalancer{}
 	}

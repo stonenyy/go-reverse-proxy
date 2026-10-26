@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go-reverse-proxy/internal/config"
@@ -91,6 +92,10 @@ func (r *Router) UpdateRoutes(routes []config.RouteConfig) error {
 				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 				return
 			}
+
+			// 记录连接数增加
+			atomic.AddInt64(&backend.ActiveConnections, 1)
+			defer atomic.AddInt64(&backend.ActiveConnections, -1)
 
 			// ✅ WebSocket 请求：直接 TCP 隧道，不经过 ReverseProxy
 			if isWebSocketRequest(r) {
