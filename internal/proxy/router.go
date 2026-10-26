@@ -3,7 +3,6 @@ package proxy
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -103,8 +102,8 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 		// 按路由挂载 Header 校验中间件
 		if len(rc.RequiredHeaders) > 0 {
 			h = middleware.HeaderAuth(rc.RequiredHeaders)(h)
-			logger.Log.Info("Header authentication enabled for route", 
-				zap.String("path", rc.Path), 
+			logger.Log.Info("Header authentication enabled for route",
+				zap.String("path", rc.Path),
 				zap.Int("rules_count", len(rc.RequiredHeaders)),
 			)
 		}
@@ -147,9 +146,9 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 	}
 
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Log.Error("Proxy request failed", 
-			zap.String("path", r.URL.Path), 
-			zap.String("target", target.String()), 
+		logger.Log.Error("Proxy request failed",
+			zap.String("path", r.URL.Path),
+			zap.String("target", target.String()),
 			zap.Error(err),
 		)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -184,10 +183,17 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	var backendConn net.Conn
 	var err error
 	if target.Scheme == "https" || target.Scheme == "wss" {
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		dialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
 		backendConn, err = tls.DialWithDialer(dialer, "tcp", backendAddr, &tls.Config{})
 	} else {
-		backendConn, err = net.DialTimeout("tcp", backendAddr, 10*time.Second)
+		dialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		backendConn, err = dialer.Dial("tcp", backendAddr)
 	}
 	if err != nil {
 		logger.Log.Error("Connection failed", zap.String("addr", backendAddr), zap.Error(err))
@@ -210,6 +216,12 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	}
 	defer clientConn.Close()
 
+	// 设置 TCP KeepAlive 避免死连接
+	if tc, ok := clientConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	// 把原始 HTTP 升级请求转发给后端
 	if err := r.Write(backendConn); err != nil {
 		logger.Log.Error("WebSocket handshake forward failed", zap.Error(err))
@@ -223,22 +235,41 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 
 	// 双向 TCP copy
 	done := make(chan struct{}, 2)
+	const idleTimeout = 60 * time.Second
+
+	copyFunc := func(dst, src net.Conn) {
+		defer func() { done <- struct{}{} }()
+
+		// 循环读取，以便在每次成功传输后刷新 Deadline
+		buf := make([]byte, 32*1024)
+		for {
+			// 设置读超时，防止死连接
+			src.SetReadDeadline(time.Now().Add(idleTimeout))
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
 
 	go func() {
-		// 后端 → 客户端（先把 bufio 里缓存的数据刷完）
+		// 后端 → 客户端
 		if bufrw.Reader.Buffered() > 0 {
 			buf := make([]byte, bufrw.Reader.Buffered())
 			bufrw.Read(buf)
 			backendConn.Write(buf)
 		}
-		io.Copy(clientConn, backendConn)
-		done <- struct{}{}
+		copyFunc(clientConn, backendConn)
 	}()
 
 	go func() {
 		// 客户端 → 后端
-		io.Copy(backendConn, clientConn)
-		done <- struct{}{}
+		copyFunc(backendConn, clientConn)
 	}()
 
 	<-done
