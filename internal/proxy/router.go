@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"go-reverse-proxy/internal/config"
+	"go-reverse-proxy/internal/logger"
 	"go-reverse-proxy/internal/middleware"
+
+	"go.uber.org/zap"
 )
 
 // Route 路由规则
@@ -86,10 +89,15 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 			// 普通 HTTP 请求：走 ReverseProxy
 			rp, ok := route.ReverseProxies[backend.URL.String()]
 			if !ok {
+				logger.Log.Error("Internal Server Error", zap.String("path", r.URL.Path))
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("[INFO] %s %s -> %s", r.Method, r.URL.Path, backend.URL.String())
+			logger.Log.Info("Proxying request",
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("backend", backend.URL.String()),
+			)
 			rp.ServeHTTP(w, r)
 		})
 
@@ -137,7 +145,11 @@ func newReverseProxy(target *url.URL, transport *http.Transport) *httputil.Rever
 	}
 
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[ERROR] 代理请求失败 %s -> %s: %v", r.URL.Path, target.String(), err)
+		logger.Log.Error("Proxy request failed", 
+			zap.String("path", r.URL.Path), 
+			zap.String("target", target.String()), 
+			zap.Error(err),
+		)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
@@ -176,7 +188,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 		backendConn, err = net.DialTimeout("tcp", backendAddr, 10*time.Second)
 	}
 	if err != nil {
-		log.Printf("[WS ERROR] 连接后端失败 %s: %v", backendAddr, err)
+		logger.Log.Error("Connection failed", zap.String("addr", backendAddr), zap.Error(err))
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
@@ -185,24 +197,27 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	// 劫持客户端连接
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("[WS ERROR] 不支持 Hijack")
+		logger.Log.Error("Hijack not supported", zap.String("path", r.URL.Path))
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	clientConn, bufrw, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("[WS ERROR] Hijack 失败: %v", err)
+		logger.Log.Error("Hijack failed", zap.String("path", r.URL.Path), zap.Error(err))
 		return
 	}
 	defer clientConn.Close()
 
 	// 把原始 HTTP 升级请求转发给后端
 	if err := r.Write(backendConn); err != nil {
-		log.Printf("[WS ERROR] 转发握手请求失败: %v", err)
+		logger.Log.Error("WebSocket handshake forward failed", zap.Error(err))
 		return
 	}
 
-	log.Printf("[WS] %s %s <-> %s", r.Method, r.URL.Path, backendAddr)
+	logger.Log.Info("WebSocket connection established",
+		zap.String("path", r.URL.Path),
+		zap.String("backend", backendAddr),
+	)
 
 	// 双向 TCP copy
 	done := make(chan struct{}, 2)
@@ -225,7 +240,7 @@ func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	}()
 
 	<-done
-	log.Printf("[WS] 连接关闭: %s", r.URL.Path)
+	logger.Log.Info("WebSocket connection closed", zap.String("path", r.URL.Path))
 }
 
 // Match 匹配路由

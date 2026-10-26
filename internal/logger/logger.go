@@ -2,28 +2,17 @@ package logger
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-type dailyFileWriter struct {
-	mu          sync.Mutex
-	dir         string
-	currentDate string
-	file        *os.File
-}
+var Log *zap.Logger
 
-var currentWriter *dailyFileWriter
-
-// Init 初始化日志系统：
-// - 支持 LOG_DIR 环境变量覆盖
-// - 相对路径优先基于当前工作目录解析，避免服务运行时落到二进制目录
-// - 如果无法创建目标目录，会依次回退到 /var/log/go-reverse-proxy 或临时目录
-// - 日志同时写入 stdout 和文件，按天轮换
+// Init 初始化日志系统
 func Init(logDir string) error {
 	if envDir := os.Getenv("LOG_DIR"); envDir != "" {
 		logDir = envDir
@@ -33,8 +22,8 @@ func Init(logDir string) error {
 	}
 
 	if !filepath.IsAbs(logDir) {
-		logRoot := resolveLogBase(logDir)
-		logDir = filepath.Join(logRoot, logDir)
+		cwd, _ := os.Getwd()
+		logDir = filepath.Join(cwd, logDir)
 	}
 
 	// 尝试创建目录，若失败则尝试回退位置
@@ -52,84 +41,29 @@ func Init(logDir string) error {
 		}
 	}
 
-	writer, err := newDailyFileWriter(logDir)
+	// 配置 Zap
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
+
+	// 日志文件路径 (按天)
+	filePath := filepath.Join(logDir, time.Now().Format("2006-01-02")+".log")
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("无法打开日志文件: %v", err)
 	}
 
-	log.Printf("日志写入目录: %s", logDir)
+	core := zapcore.NewTee(
+		zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(os.Stdout), zap.InfoLevel),
+		zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.AddSync(file), zap.InfoLevel),
+	)
 
-	log.SetOutput(io.MultiWriter(os.Stdout, writer))
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.SetPrefix("")
-	currentWriter = writer
-
+	Log = zap.New(core, zap.AddCaller())
 	return nil
 }
 
-// Close 关闭当前日志文件。
-func Close() error {
-	if currentWriter == nil {
-		return nil
+func Close() {
+	if Log != nil {
+		_ = Log.Sync()
 	}
-	return currentWriter.Close()
-}
-
-func newDailyFileWriter(logDir string) (*dailyFileWriter, error) {
-	w := &dailyFileWriter{dir: logDir}
-	if err := w.rotate(); err != nil {
-		return nil, err
-	}
-	return w, nil
-}
-
-func resolveLogBase(logDir string) string {
-	if cwd, err := os.Getwd(); err == nil {
-		return cwd
-	}
-	if exe, err := os.Executable(); err == nil {
-		return filepath.Dir(exe)
-	}
-	return "."
-}
-
-func (w *dailyFileWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.needsRotate() {
-		if err := w.rotate(); err != nil {
-			return 0, err
-		}
-	}
-	return w.file.Write(p)
-}
-
-func (w *dailyFileWriter) needsRotate() bool {
-	return w.file == nil || time.Now().Format("2006-01-02") != w.currentDate
-}
-
-func (w *dailyFileWriter) rotate() error {
-	if w.file != nil {
-		_ = w.file.Close()
-	}
-
-	date := time.Now().Format("2006-01-02")
-	path := filepath.Join(w.dir, date+".log")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-
-	w.file = file
-	w.currentDate = date
-	return nil
-}
-
-func (w *dailyFileWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.file == nil {
-		return nil
-	}
-	return w.file.Close()
 }

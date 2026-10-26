@@ -30,7 +30,7 @@ func main() {
 		log.Fatalf("初始化日志失败: %v", err)
 	}
 	defer func() {
-		_ = logger.Close()
+		logger.Close()
 	}()
 
 	// 加载配置
