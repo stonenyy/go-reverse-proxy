@@ -37,8 +37,8 @@ type Router struct {
 
 func NewRouter(routes []config.RouteConfig) (*Router, error) {
 	transport := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
@@ -75,7 +75,7 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			backend := route.Balancer.Next(route.Backends)
 			if backend == nil {
-				log.Printf("[ERROR] 没有可用的后端节点: %s", r.URL.Path)
+				logger.Log.Error("No available backend nodes", zap.String("path", r.URL.Path))
 				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 				return
 			}
@@ -104,7 +104,10 @@ func NewRouter(routes []config.RouteConfig) (*Router, error) {
 		// 按路由挂载 Header 校验中间件
 		if len(rc.RequiredHeaders) > 0 {
 			h = middleware.HeaderAuth(rc.RequiredHeaders)(h)
-			log.Printf("[路由] %s 已启用 Header 校验，规则数: %d", rc.Path, len(rc.RequiredHeaders))
+			logger.Log.Info("Header authentication enabled for route", 
+				zap.String("path", rc.Path), 
+				zap.Int("rules_count", len(rc.RequiredHeaders)),
+			)
 		}
 
 		route.Handler = h
